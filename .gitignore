@@ -1,0 +1,7 @@
+results/
+*.log
+*.json.bak
+.DS_Store
+.completed_sources
+.partial_subdomains
+*.swp
