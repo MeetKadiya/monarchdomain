@@ -44,6 +44,47 @@ curl, dig, openssl, nc
 
 ---
 
+## 📦 Installation
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/MeetKadiya/MonarchDomain.git
+   cd MonarchDomain
+   ```
+
+2. **Install dependencies** (Kali Linux / Debian-based)
+   ```bash
+   sudo apt update
+   sudo apt install -y curl openssl dnsutils netcat-traditional
+   ```
+   > `dig` comes from `dnsutils`; `nc` comes from `netcat-traditional` (or `netcat-openbsd` - either works).
+   > On Kali, most of these are usually preinstalled - this step just fills in anything missing.
+
+3. **Make the script executable**
+   ```bash
+   chmod +x monarchdomain.sh
+   ```
+
+4. **(Optional) Install globally** so you can run it as `monarchdomain` from anywhere
+   ```bash
+   sudo ln -s "$(pwd)/monarchdomain.sh" /usr/local/bin/monarchdomain
+   ```
+
+5. **(Optional) Install `httpx`** for the `--use-httpx` faster/richer live-host checks
+   ```bash
+   sudo apt install -y golang-go   # if Go isn't already installed
+   go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+   export PATH=$PATH:$(go env GOPATH)/bin   # add to ~/.bashrc or ~/.zshrc to persist
+   ```
+
+6. **Verify it works**
+   ```bash
+   ./monarchdomain.sh -h
+   ```
+   You should see the usage/help output shown below.
+
+---
+
 ## 🚀 Usage
 
 ```bash
