@@ -403,7 +403,8 @@ function dns_brute() {
 
 function detect_wildcard() {
   local domain="$1"
-  local probe="$(head /dev/urandom | tr -dc a-z0-9 | head -c 14).$domain"
+  local probe
+  probe="$(head /dev/urandom | tr -dc a-z0-9 | head -c 14).$domain"
   if dig +short "$probe" 2>/dev/null | grep -qE '[0-9]'; then
     echo "true"
   else
@@ -518,10 +519,10 @@ function run_diff() {
 function record_finding() {
   local sev="$1" msg="$2" host="${3:-}"
   local lc="${msg,,}"
-  local existing h2 s2 m2
+  local existing h2 m2
   for existing in "${FINDINGS[@]:-}"; do
     [[ -z "$existing" ]] && continue
-    IFS='|' read -r s2 h2 m2 <<< "$existing"
+    IFS='|' read -r _ h2 m2 <<< "$existing"
     if [[ "$h2" == "$host" && "${m2,,}" == *"$lc"* ]]; then
       return
     fi
@@ -662,6 +663,10 @@ function main() {
   fi
 
   log_line INFO "=== MonarchDomain v$VERSION run started for $DOMAIN (stealth=$STEALTH) ==="
+  if [[ -n "$CONFIG_LOADED" ]]; then
+    log_line INFO "Loaded config file: $CONFIG_LOADED"
+    info "${CYAN}[*] Loaded config: $CONFIG_LOADED${RESET}"
+  fi
 
   local timestamp results_dir resuming=0
   if [[ $RESUME -eq 1 ]]; then
