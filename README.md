@@ -46,6 +46,28 @@ curl, dig, openssl, nc
 
 ## 📦 Installation
 
+### Option A: Quick install (recommended)
+
+The repo ships with an `install.sh` that handles everything below in one step.
+
+```bash
+git clone https://github.com/MeetKadiya/MonarchDomain.git
+cd MonarchDomain
+chmod +x install.sh
+sudo ./install.sh
+```
+
+This will:
+- Install dependencies (`curl`, `dnsutils`, `openssl`, `netcat-openbsd`) via `apt-get`
+- Print a hint to install `httpx-toolkit` if you don't already have `httpx` (needed for `--use-httpx`)
+- Make `monarchdomain.sh` executable
+- Symlink it to `/usr/local/bin/monarchdomain`, so you can run `monarchdomain -d example.com` from anywhere
+
+> `sudo` is required so the installer can install packages and write the symlink into `/usr/local/bin`.
+> Tip: create `~/.monarchdomainrc` afterward to set your own defaults (`THREADS`, `STEALTH`, `PROXY`, ...).
+
+### Option B: Manual installation
+
 1. **Clone the repository**
    ```bash
    git clone https://github.com/MeetKadiya/MonarchDomain.git
