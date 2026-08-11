@@ -1,6 +1,6 @@
 # 👑 MonarchDomain - Subdomain Finder and Vulnerability Scanner
 
-**Author:** Meet_Kadiya 
+**Author:** MeetKadiya 
 **Version:** 1.0.0
 **File:** `monarchdomain.sh`  
 **Purpose:** Discover subdomains and perform quick vulnerability assessments — ideal for bug bounty or recon workflows.
