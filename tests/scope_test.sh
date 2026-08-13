@@ -6,6 +6,14 @@
 # These tests source monarchdomain.sh directly (main() is guarded so
 # sourcing does not execute a scan) and exercise the scope functions
 # in isolation - no network access required.
+#
+# Most test bodies below set MonarchDomain's globals (SCOPE_FILE,
+# STRICT_SCOPE, QUIET, ...) and then call functions defined in the
+# sourced monarchdomain.sh (scope_load, apply_scope_filters, ...).
+# ShellCheck can't see across that source boundary (SC1091 above is
+# suppressed for the same reason), so it sometimes flags these
+# assignments as unused even though monarchdomain.sh reads them.
+# shellcheck disable=SC2034
 
 setup() {
   SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")/.." && pwd)"
