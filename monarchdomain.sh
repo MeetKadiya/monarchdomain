@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# MonarchDomain v1.0.0 - Subdomain Enumeration & Recon Vulnerability Scanner
+# MonarchDomain v1.1.0 - Subdomain Enumeration & Recon Vulnerability Scanner
 # Author: Meet_Kadiya
 # License: MIT
 #
@@ -10,7 +10,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 trap 'echo -e "\n${YELLOW:-}[!] Interrupted by user. Progress saved - rerun with --resume to continue.${RESET:-}"; exit 130' INT
 
@@ -41,6 +41,7 @@ LOG_FILE=""
 WORDLIST_FILE=""
 EXCLUDE_FILE=""
 SCOPE_FILE=""
+STRICT_SCOPE=0
 PROXY=""
 QUIET=0
 DELAY_MIN=1
@@ -72,6 +73,15 @@ declare -a COMMON_PORTS=("${DEFAULT_PORTS[@]}")
 
 declare -a FINDINGS=()
 declare -a subdomains=()
+
+# Scope enforcement state (populated by scope_load)
+SCOPE_ENABLED=0
+declare -a SCOPE_DOMAIN_ENTRIES=()    # bare domain -> matches itself + subdomains
+declare -a SCOPE_WILDCARD_ENTRIES=()  # *.domain    -> matches subdomains only
+declare -a SCOPE_IP_ENTRIES=()        # normalized IPv4/IPv6 literals
+SCOPE_IN_COUNT=0
+SCOPE_OUT_COUNT=0
+SCOPE_BLOCKED_COUNT=0
 
 CONFIG_LOADED=""
 for cfg in "$HOME/.monarchdomainrc" "./.monarchdomainrc"; do
@@ -128,8 +138,16 @@ Performance & stealth:
       --use-httpx         Use httpx (if installed) for faster/richer live-host probing
 
 Scope control:
-  -e, --exclude FILE      Skip any subdomain matching an entry in FILE
-      --scope FILE        Only scan subdomains matching an entry in FILE (allow-list)
+  -e, --exclude FILE      Skip any subdomain matching an entry in FILE (deny-list)
+      --scope FILE        Only touch assets matching an entry in FILE (allow-list).
+                           Enforced before DNS brute force, live checks, wildcard
+                           checks, port scans and vulnerability scans. Supports
+                           exact domains (also allows their subdomains), explicit
+                           wildcards (*.example.com), and IPv4/IPv6 literals.
+                           See "Authorized Scope" in README.md.
+      --strict-scope       Refuse to run without --scope, and refuse to run if the
+                           scope file resolves to zero valid entries. Use this for
+                           unattended/CI runs where silent fail-open is unacceptable.
 
 Continuity:
       --resume            Resume an interrupted run (reuses last results dir for domain)
@@ -153,6 +171,7 @@ Examples:
   $0 -d example.com -f json -o report.json
   $0 -d example.com -x socks5://127.0.0.1:9050 -m paranoid
   $0 -d example.com --scope program-scope.txt -e excluded.txt
+  $0 -d example.com --scope program-scope.txt --strict-scope
   $0 -d example.com --ports "80,443,8000-8010" --use-httpx
   $0 -d example.com --resume
   $0 -d example.com --diff
@@ -186,6 +205,7 @@ function parse_args() {
       --use-httpx) USE_HTTPX=1; shift ;;
       -e|--exclude) EXCLUDE_FILE="$2"; shift 2 ;;
       --scope) SCOPE_FILE="$2"; shift 2 ;;
+      --strict-scope) STRICT_SCOPE=1; shift ;;
       --resume) RESUME=1; shift ;;
       --diff) DIFF_MODE=1; shift ;;
       -o|--output) OUTPUT_FILE="$2"; shift 2 ;;
@@ -375,7 +395,226 @@ function checkpoint_append_subs() {
 }
 
 # ---------------------------------------------------------------------------
+# Scope enforcement (Authorized Scope Enforcement)
+#
+# Design:
+#   - SCOPE_DOMAIN_ENTRIES:   "example.com"   -> matches example.com AND any
+#                              *.example.com subdomain.
+#   - SCOPE_WILDCARD_ENTRIES: "*.example.com" -> matches subdomains only
+#                              (example.com itself must be listed separately
+#                              if it should also be in scope).
+#   - SCOPE_IP_ENTRIES:       normalized IPv4/IPv6 literals, exact match only.
+#
+#   All comparisons are done on normalized values (lowercase, no scheme, no
+#   trailing dot, no path/port) and use a "." boundary check for subdomain
+#   matching so "example.com.evil.com" can never match a scope entry of
+#   "example.com" (it does not end in ".example.com").
+#
+#   Anything that fails to normalize cleanly (malformed hostname, raw
+#   non-ASCII/IDN label, empty string) is treated as OUT OF SCOPE. Scope
+#   enforcement fails closed, never open.
+# ---------------------------------------------------------------------------
+function is_ipv4() {
+  local ip="$1" o
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+    # Reject ambiguous leading-zero octets (e.g. 010) rather than guess
+    # decimal-vs-octal intent - a classic scope-check bypass vector.
+    [[ "$o" =~ ^0[0-9]+$ ]] && return 1
+    (( 10#$o <= 255 )) || return 1
+  done
+  return 0
+}
+
+function is_ipv6() {
+  local ip="$1"
+  [[ "$ip" == *:* ]] || return 1
+  [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+  return 0
+}
+
+function normalize_ipv4() {
+  local ip="$1" o1 o2 o3 o4
+  IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+  printf '%d.%d.%d.%d' "$((10#$o1))" "$((10#$o2))" "$((10#$o3))" "$((10#$o4))"
+}
+
+function normalize_ipv6() {
+  local ip="$1"
+  if command -v python3 &>/dev/null; then
+    local out
+    out=$(python3 -c '
+import ipaddress, sys
+try:
+    print(ipaddress.ip_address(sys.argv[1]).compressed)
+except Exception:
+    sys.exit(1)
+' "$ip" 2>/dev/null)
+    if [[ -n "$out" ]]; then
+      printf '%s' "$out"
+      return 0
+    fi
+  fi
+  # Best-effort fallback when python3 is unavailable: lowercase only.
+  # This is not full RFC 5952 canonicalization; install python3 for
+  # fully reliable IPv6 scope comparisons.
+  printf '%s' "${ip,,}"
+}
+
+function is_valid_hostname() {
+  local h="$1"
+  [[ "$h" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]]
+}
+
+# Normalizes a target/scope-entry string for safe comparison.
+# Prints the normalized value and returns 0 on success, or prints
+# nothing and returns 1 if the input is malformed / cannot be
+# safely normalized (fail closed).
+function normalize_target() {
+  local t="$1"
+  t="${t#http://}"; t="${t#https://}"
+  t="${t#*@}"                 # strip userinfo@ if present
+  t="${t%%/*}"                 # strip path
+  t="${t,,}"                   # lowercase
+  while [[ "$t" == *. ]]; do t="${t%.}"; done   # strip trailing dot(s)
+
+  # Bracketed IPv6 literal, optionally with :port -> [::1] or [::1]:8443
+  if [[ "$t" == \[*\]* ]]; then
+    t="${t#\[}"; t="${t%%\]*}"
+    if is_ipv6 "$t"; then
+      normalize_ipv6 "$t"
+      return 0
+    fi
+    return 1
+  fi
+
+  if is_ipv4 "$t"; then
+    normalize_ipv4 "$t"
+    return 0
+  fi
+  if is_ipv6 "$t"; then
+    normalize_ipv6 "$t"
+    return 0
+  fi
+
+  # Bare hostname:port (only strip if what remains is a plausible hostname)
+  if [[ "$t" =~ ^([a-z0-9.-]+):[0-9]+$ ]]; then
+    t="${BASH_REMATCH[1]}"
+  fi
+
+  # Fail closed on anything outside the ASCII hostname charset - this
+  # rejects raw-Unicode/homograph IDN input rather than guessing at a
+  # punycode conversion. Pre-encode IDN scope entries as xn--... (which
+  # are pure ASCII and pass through here normally).
+  [[ "$t" =~ [^a-z0-9.-] ]] && return 1
+
+  is_valid_hostname "$t" || return 1
+  printf '%s' "$t"
+  return 0
+}
+
+# Loads and normalizes $SCOPE_FILE into the SCOPE_* arrays. No-op if
+# SCOPE_FILE is unset. Exits the program if SCOPE_FILE is set but missing,
+# or (with --strict-scope) if it resolves to zero valid entries.
+function scope_load() {
+  SCOPE_ENABLED=0
+  SCOPE_DOMAIN_ENTRIES=(); SCOPE_WILDCARD_ENTRIES=(); SCOPE_IP_ENTRIES=()
+  [[ -z "$SCOPE_FILE" ]] && return 0
+
+  if [[ ! -f "$SCOPE_FILE" ]]; then
+    echo -e "${RED}[Error]${RESET} Scope file not found: $SCOPE_FILE" >&2
+    exit 1
+  fi
+
+  local raw norm line_no=0 is_wild base key
+  declare -A seen=()
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line_no=$((line_no + 1))
+    raw="${raw%%#*}"    # strip trailing comments
+    raw="${raw#"${raw%%[![:space:]]*}"}"   # trim leading whitespace
+    raw="${raw%"${raw##*[![:space:]]}"}"   # trim trailing whitespace
+    [[ -z "$raw" ]] && continue
+
+    is_wild=0; base="$raw"
+    if [[ "$base" == \*.* ]]; then
+      is_wild=1
+      base="${base#\*.}"
+    fi
+
+    if ! norm="$(normalize_target "$base")"; then
+      echo -e "${YELLOW}[Warning]${RESET} Ignoring malformed scope entry on line $line_no: '$raw'" >&2
+      continue
+    fi
+
+    key="$([[ $is_wild -eq 1 ]] && echo "*.$norm" || echo "$norm")"
+    [[ -n "${seen[$key]:-}" ]] && continue   # de-duplicate
+    seen[$key]=1
+
+    if is_ipv4 "$base" || is_ipv6 "$base"; then
+      SCOPE_IP_ENTRIES+=("$norm")
+    elif [[ $is_wild -eq 1 ]]; then
+      SCOPE_WILDCARD_ENTRIES+=("$norm")
+    else
+      SCOPE_DOMAIN_ENTRIES+=("$norm")
+    fi
+  done < "$SCOPE_FILE"
+
+  local total=$(( ${#SCOPE_DOMAIN_ENTRIES[@]} + ${#SCOPE_WILDCARD_ENTRIES[@]} + ${#SCOPE_IP_ENTRIES[@]} ))
+  if (( total == 0 )); then
+    echo -e "${YELLOW}[Warning]${RESET} Scope file '$SCOPE_FILE' contains no valid entries - everything will be treated as out of scope." >&2
+    if [[ $STRICT_SCOPE -eq 1 ]]; then
+      echo -e "${RED}[Fatal]${RESET} --strict-scope requires at least one valid scope entry." >&2
+      exit 1
+    fi
+  fi
+
+  SCOPE_ENABLED=1
+  info "${CYAN}[*] Scope enforcement enabled: $SCOPE_FILE (${#SCOPE_DOMAIN_ENTRIES[@]} domain, ${#SCOPE_WILDCARD_ENTRIES[@]} wildcard, ${#SCOPE_IP_ENTRIES[@]} IP entries)${RESET}"
+}
+
+# Returns 0 (true) if $1 is in scope, 1 otherwise. Always true when scope
+# enforcement is disabled. Fails closed on malformed/unparseable input.
+function scope_in_scope() {
+  local raw="$1" target e
+  (( SCOPE_ENABLED == 0 )) && return 0
+
+  target="$(normalize_target "$raw")" || return 1
+  [[ -z "$target" ]] && return 1
+
+  for e in ${SCOPE_IP_ENTRIES[@]+"${SCOPE_IP_ENTRIES[@]}"}; do
+    [[ "$target" == "$e" ]] && return 0
+  done
+  for e in ${SCOPE_DOMAIN_ENTRIES[@]+"${SCOPE_DOMAIN_ENTRIES[@]}"}; do
+    if [[ "$target" == "$e" || "$target" == *".$e" ]]; then
+      return 0
+    fi
+  done
+  for e in ${SCOPE_WILDCARD_ENTRIES[@]+"${SCOPE_WILDCARD_ENTRIES[@]}"}; do
+    [[ "$target" == *".$e" ]] && return 0
+  done
+  return 1
+}
+
+function scope_block_msg() {
+  echo -e "${RED}[SCOPE] BLOCKED:${RESET} $1"
+}
+
+function scope_ignored_msg() {
+  echo -e "${YELLOW}[SCOPE] OUT OF SCOPE — ignored:${RESET} $1"
+}
+
+function print_scope_summary() {
+  (( SCOPE_ENABLED == 0 )) && return 0
+  echo -e "\n${BOLD}${CYAN}=== Scope Summary ===${RESET}"
+  echo -e "  In scope:           ${GREEN}$SCOPE_IN_COUNT${RESET}"
+  echo -e "  Out of scope:       ${YELLOW}$SCOPE_OUT_COUNT${RESET}"
+  echo -e "  Blocked operations: ${RED}$SCOPE_BLOCKED_COUNT${RESET}"
+}
+
+# ---------------------------------------------------------------------------
 # DNS brute force (parallel unless stealth != normal)
+# Scope is enforced HERE, before any dig call is issued, so out-of-scope
+# candidates never trigger a DNS resolution in the first place.
 # ---------------------------------------------------------------------------
 function dns_brute() {
   local domain="$1"
@@ -388,16 +627,30 @@ function dns_brute() {
   local workers; workers=$(effective_threads)
   info "\n${BOLD}${CYAN}[*] DNS brute force: ${#words[@]} candidate(s), $workers worker(s), stealth=$STEALTH${RESET}"
 
+  local -a candidates=()
+  local w sub
+  for w in "${words[@]}"; do
+    sub="${w,,}.$domain"
+    if (( SCOPE_ENABLED == 1 )) && ! scope_in_scope "$sub"; then
+      # Emitted (not counted here) because this function runs inside a
+      # process-substitution subshell - the caller tallies BLOCKED: lines
+      # into SCOPE_BLOCKED_COUNT so the stat survives the subshell boundary.
+      echo "BLOCKED:$sub"
+      continue
+    fi
+    candidates+=("$sub")
+  done
+
   if (( workers <= 1 )); then
-    local w sub
-    for w in "${words[@]}"; do
-      sub="$w.$domain"
+    for sub in "${candidates[@]}"; do
       dig +short "$sub" 2>/dev/null | grep -qE '[0-9a-fA-F:.]' && echo "$sub"
       stealth_delay
     done
   else
-    printf "%s\n" "${words[@]}" | sed "s/\$/.${domain}/" | \
-      xargs -P "$workers" -I{} bash -c 'dig +short "{}" 2>/dev/null | grep -qE "[0-9a-fA-F:.]" && echo "{}"'
+    if (( ${#candidates[@]} > 0 )); then
+      printf "%s\n" "${candidates[@]}" | \
+        xargs -P "$workers" -I{} bash -c 'dig +short "{}" 2>/dev/null | grep -qE "[0-9a-fA-F:.]" && echo "{}"'
+    fi
   fi
 }
 
@@ -464,21 +717,30 @@ function filter_live() {
   fi
 }
 
+# Applies scope (allow-list) then exclude (deny-list) filtering to the
+# array named by $1, in place. Scope filtering runs first since it is the
+# authorization boundary; exclude further narrows an already-authorized set.
 function apply_scope_filters() {
   local -n arr_ref=$1
-  if [[ -n "$SCOPE_FILE" && -f "$SCOPE_FILE" ]]; then
+  if (( SCOPE_ENABLED == 1 )); then
     local filtered=() sub
-    for sub in "${arr_ref[@]}"; do
-      grep -qxF "$sub" "$SCOPE_FILE" 2>/dev/null && filtered+=("$sub")
+    for sub in ${arr_ref[@]+"${arr_ref[@]}"}; do
+      if scope_in_scope "$sub"; then
+        filtered+=("$sub")
+        SCOPE_IN_COUNT=$((SCOPE_IN_COUNT + 1))
+      else
+        SCOPE_OUT_COUNT=$((SCOPE_OUT_COUNT + 1))
+        [[ $QUIET -eq 0 ]] && scope_ignored_msg "$sub"
+      fi
     done
-    arr_ref=("${filtered[@]}")
+    arr_ref=(${filtered[@]+"${filtered[@]}"})
   fi
   if [[ -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
     local kept=() sub
-    for sub in "${arr_ref[@]}"; do
+    for sub in ${arr_ref[@]+"${arr_ref[@]}"}; do
       grep -qxF "$sub" "$EXCLUDE_FILE" 2>/dev/null || kept+=("$sub")
     done
-    arr_ref=("${kept[@]}")
+    arr_ref=(${kept[@]+"${kept[@]}"})
   fi
 }
 
@@ -563,6 +825,13 @@ function detect_waf() {
 
 function vuln_scan() {
   local host="$1"
+
+  if (( SCOPE_ENABLED == 1 )) && ! scope_in_scope "$host"; then
+    scope_block_msg "$host"
+    SCOPE_BLOCKED_COUNT=$((SCOPE_BLOCKED_COUNT + 1))
+    return
+  fi
+
   info "\n${BOLD}${CYAN}[*] Scanning $host${RESET}"
 
   detect_waf "$host" > /dev/null
@@ -637,7 +906,14 @@ function write_json_report() {
       printf '    {"severity": "%s", "host": "%s", "message": "%s"}%s\n' \
         "$(json_escape "$sev")" "$(json_escape "$host")" "$(json_escape "$msg")" "$([[ $i -lt $((n-1)) ]] && echo ,)"
     done
-    echo "  ]"
+    echo "  ],"
+    echo "  \"scope\": {"
+    echo "    \"enabled\": $([[ $SCOPE_ENABLED -eq 1 ]] && echo true || echo false),"
+    echo "    \"scope_file\": \"$(json_escape "${SCOPE_FILE:-}")\","
+    echo "    \"in_scope\": $SCOPE_IN_COUNT,"
+    echo "    \"out_of_scope\": $SCOPE_OUT_COUNT,"
+    echo "    \"blocked_operations\": $SCOPE_BLOCKED_COUNT"
+    echo "  }"
     echo "}"
   } > "$out"
 }
@@ -655,11 +931,22 @@ function main() {
     echo -e "${RED}[Error]${RESET} --threads must be a positive integer."
     exit 1
   fi
+  if [[ $STRICT_SCOPE -eq 1 && -z "$SCOPE_FILE" ]]; then
+    echo -e "${RED}[Error]${RESET} --strict-scope requires --scope FILE."
+    exit 1
+  fi
   if ! DOMAIN=$(validate_domain "$DOMAIN"); then
     exit 1
   fi
   if [[ -n "$PORTS_SPEC" ]]; then
     mapfile -t COMMON_PORTS < <(parse_ports_spec "$PORTS_SPEC") || exit 1
+  fi
+
+  scope_load
+  if (( SCOPE_ENABLED == 1 )) && ! scope_in_scope "$DOMAIN"; then
+    scope_block_msg "$DOMAIN"
+    echo -e "${RED}[Fatal]${RESET} Target domain '$DOMAIN' is not covered by scope file '$SCOPE_FILE'. Refusing to scan." >&2
+    exit 1
   fi
 
   log_line INFO "=== MonarchDomain v$VERSION run started for $DOMAIN (stealth=$STEALTH) ==="
@@ -712,8 +999,18 @@ function main() {
     [[ "$SOURCES" == "all" || "$SOURCES" == *otx* ]]      && run_source_if_needed "otx" src_otx
     [[ "$SOURCES" == "all" || "$SOURCES" == *rapiddns* ]] && run_source_if_needed "rapiddns" src_rapiddns
     if ! { (( resuming )) && checkpoint_is_done "$results_dir" "dns_brute"; }; then
-      mapfile -t t < <(dns_brute "$DOMAIN"); combined+=("${t[@]}")
-      checkpoint_append_subs "$results_dir" "${t[@]}"
+      mapfile -t t < <(dns_brute "$DOMAIN")
+      local -a brute_resolved=() line
+      for line in ${t[@]+"${t[@]}"}; do
+        if [[ "$line" == BLOCKED:* ]]; then
+          SCOPE_BLOCKED_COUNT=$((SCOPE_BLOCKED_COUNT + 1))
+          [[ $QUIET -eq 0 ]] && scope_block_msg "${line#BLOCKED:}"
+        else
+          brute_resolved+=("$line")
+        fi
+      done
+      combined+=(${brute_resolved[@]+"${brute_resolved[@]}"})
+      checkpoint_append_subs "$results_dir" ${brute_resolved[@]+"${brute_resolved[@]}"}
       checkpoint_mark_done "$results_dir" "dns_brute"
     else
       info "${CYAN}[*] Skipping already-completed source: dns_brute${RESET}"
@@ -746,6 +1043,7 @@ function main() {
     fi
 
     if [[ $MODE_SUBS_ONLY -eq 1 ]]; then
+      print_scope_summary
       log_line INFO "Run complete (subs-only)."
       exit 0
     fi
@@ -761,6 +1059,7 @@ function main() {
   done
 
   print_findings
+  print_scope_summary
 
   if [[ "$OUTPUT_FORMAT" == "json" ]]; then
     write_json_report "${OUTPUT_FILE:-$results_dir/report.json}"
@@ -778,6 +1077,16 @@ function main() {
         IFS='|' read -r sev host msg <<< "$f"
         printf '  [%s] (%s) %s\n' "$sev" "$host" "$msg"
       done
+      echo
+      echo "Scope:"
+      if [[ $SCOPE_ENABLED -eq 1 ]]; then
+        echo "  Enabled: yes ($SCOPE_FILE)"
+        echo "  In scope: $SCOPE_IN_COUNT"
+        echo "  Out of scope: $SCOPE_OUT_COUNT"
+        echo "  Blocked operations: $SCOPE_BLOCKED_COUNT"
+      else
+        echo "  Enabled: no"
+      fi
     } > "${OUTPUT_FILE:-$results_dir/report.txt}"
   fi
 
@@ -789,5 +1098,7 @@ function main() {
   return 0
 }
 
-main "$@"
-exit 0
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+  exit 0
+fi
