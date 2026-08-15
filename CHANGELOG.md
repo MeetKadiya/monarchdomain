@@ -2,6 +2,58 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioning is semver.
 
+## [Unreleased]
+
+### Changed
+- **HTML report visual redesign.** Reworked `lib/html_report.sh`'s bundled `assets/style.css`
+  for a more colorful, higher-contrast dashboard so findings and metrics are easier to scan
+  at a glance: gradient header/title, glowing color-coded severity badges and section markers
+  (accent dot per section: Scope=purple, Live Hosts=green, Ports=orange, Findings=red, etc.),
+  per-metric colored summary cards (Hosts=blue, Live=green, Ports=orange, Technologies=purple,
+  Findings=red), filled severity/status pill badges, zebra-safe hover rows, and a chip-style
+  header metadata bar. Purely presentational - no changes to `html_escape`, data model, JSON
+  output, or any test-asserted markup structure (summary-card and severity-badge inner markup
+  kept byte-identical to what `tests/html_report_test.sh` checks for). Still zero external
+  assets/CDN calls and no `<script>` tags - fully offline. Verified: `bats tests/scope_test.sh
+  tests/html_report_test.sh` (51/51 passing) and `shellcheck --severity warning` (clean).
+
+## [1.2.0] - 2026-08-14
+
+### Added
+- **Professional HTML Security Reporting (`--html-report`).** Generates an offline,
+  self-contained HTML reconnaissance dashboard (`report.html` + `assets/style.css`) from
+  the exact same normalized scan data already used for the text/JSON reports - no scanning
+  logic is duplicated.
+  - `--report-dir DIR` - override the output location (default:
+    `<results_dir>/monarch-report/`).
+  - Dashboard includes: target, generation timestamp, scan duration, scope status, summary
+    cards (Hosts Found / Live Hosts / Open Ports / Technologies / Findings), and a 5-tier
+    severity breakdown (Critical/High/Medium/Low/Informational).
+  - Dedicated sections: Executive Summary, Scope, Discovered Assets, Live Hosts, DNS
+    Intelligence, Open Ports, Technologies, TLS, Security Headers, Endpoints, Findings, and
+    Raw Data (links to `raw/report.json` and `raw/report.txt`, copies of the standard
+    outputs, written alongside the HTML report).
+  - Each finding card shows title, severity, confidence, affected asset, description,
+    evidence, and a remediation recommendation. Wording never over-claims: unconfirmed
+    observations (e.g. an unparsable TLS handshake) are labeled "Potential misconfiguration"
+    rather than asserted as vulnerabilities.
+  - Every piece of scan-derived text (domains, hosts, header names, finding messages) is
+    passed through `html_escape` before being written into the report - HTML/script
+    injection via a malicious domain, header, or finding is neutralized, not just quoted.
+  - No external CDN assets - the report (including its stylesheet) works fully offline.
+  - Does not alter, remove, or duplicate the existing text/JSON output formats or any
+    existing CLI flag.
+  - New module `lib/html_report.sh`, sourced by `monarchdomain.sh`; new architecture:
+    `scanners -> normalized result arrays -> write_text_report / write_json_report /
+    build_html_report`.
+- `tests/html_report_test.sh` - bats test suite covering HTML-escaping (script tags,
+  quotes, ampersands, unicode), empty results, large result sets (300 subdomains / 50
+  findings), multiple hosts (live and non-live), all five severity tiers, missing/empty
+  fields, and JSON/HTML consistency (subdomain and finding counts match between
+  `report.json` and `report.html`).
+- `html-report-tests` CI job (`.github/workflows/ci.yml`) running `tests/html_report_test.sh`
+  alongside the existing `scope-tests` job.
+
 ## [1.1.0] - 2026-08-13
 
 ### Added
