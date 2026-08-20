@@ -4,6 +4,55 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [1.3.0] - 2026-08-17
+
+### Added
+- **HTTP URL & Endpoint Discovery (`--endpoints`).** After a host is confirmed live,
+  MonarchDomain can discover publicly-accessible URLs/endpoints on it using only safe,
+  non-destructive, GET-only techniques - never form submission, authentication, credential
+  brute-forcing, or destructive requests, and no wordlist-based path brute-forcing.
+  - Sources: `robots.txt` (its `Sitemap:` entries and `Disallow`/`Allow` paths),
+    `sitemap.xml` (including recursive, depth-capped sitemap-index support), the homepage's
+    HTML `<a href>`/`<script src>`/`<form action>` references, JavaScript path/URL literals
+    pulled from any same-run `.js` file, and a small fixed list of common well-known/API-doc
+    paths (`/robots.txt`, `/sitemap.xml`, `/security.txt`, `/.well-known/security.txt`,
+    `/openapi.json`, `/swagger.json`, `/swagger/`, `/graphql`).
+  - URLs are normalized (scheme/host lowercased, default ports and fragments stripped,
+    trailing slashes collapsed) and deduplicated before being requested.
+  - Every discovered URL is checked against `--scope` before it is ever requested - the same
+    fail-closed scope boundary used everywhere else in the tool (Feature 1). Without
+    `--scope`, everything reachable from the target is fair game, matching the tool's
+    existing default-open behavior when no scope file is given.
+  - Conservative rate limiting: configurable per-request timeout, bounded retries with
+    429-aware backoff (reusing the same pattern as the existing `curl_fetch`), and a
+    per-host request cap (`--endpoints-max`, default 60) so discovery can't run away.
+  - Endpoints are categorized (informationally only, never as a "finding") into api,
+    authentication, documentation, static, administrative, metadata, or other, based on
+    path heuristics. A sensitive-looking path is never treated as evidence of a
+    vulnerability on its own.
+  - New CLI flags: `--endpoints` (opt-in; issues extra requests against the target, so it
+    stays off by default), `--no-endpoints`, `--endpoints-max N`.
+  - Text output gains an `[ENDPOINTS]` section; JSON output gains `"endpoints_enabled"` and
+    an `"endpoints": [{"url", "type", "source", "status_code"}, ...]` array. The HTML
+    report's previously-empty Endpoints section (Feature 2) now renders real data when
+    `--endpoints` was used.
+  - New module `lib/endpoints.sh`, sourced by `monarchdomain.sh`, following the same
+    architecture as `lib/html_report.sh`: pure, network-free parsers (`url_normalize`,
+    `url_join`, `endpoint_categorize`, `robots_extract_*`, `sitemap_*`, `html_extract_links`,
+    `js_extract_paths`) feeding a single scope-checked/rate-limited/deduped network
+    chokepoint (`endpoints_maybe_probe`) that populates the new `SCAN_ENDPOINTS` array.
+- `tests/endpoints_test.sh` - 40-case bats suite: pure-function coverage for URL
+  normalization/joining, endpoint categorization, and the robots.txt/sitemap/HTML/JS
+  parsers (including malformed input), plus integration tests against a local fixture HTTP
+  server (`tests/fixtures/endpoints/`, 127.0.0.1-only) covering deduplication, out-of-scope
+  rejection, the `--endpoints-max` cap, redirect-following, sitemap-index recursion, timeout
+  handling against a non-routable address, and a regression guard that no wordlist-based
+  brute forcing occurs.
+- `endpoints-tests` CI job (`.github/workflows/ci.yml`) running `tests/endpoints_test.sh`
+  alongside the existing `scope-tests` and `html-report-tests` jobs.
+
 ### Changed
 - **HTML report visual redesign.** Reworked `lib/html_report.sh`'s bundled `assets/style.css`
   for a more colorful, higher-contrast dashboard so findings and metrics are easier to scan
@@ -14,8 +63,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
   header metadata bar. Purely presentational - no changes to `html_escape`, data model, JSON
   output, or any test-asserted markup structure (summary-card and severity-badge inner markup
   kept byte-identical to what `tests/html_report_test.sh` checks for). Still zero external
-  assets/CDN calls and no `<script>` tags - fully offline. Verified: `bats tests/scope_test.sh
-  tests/html_report_test.sh` (51/51 passing) and `shellcheck --severity warning` (clean).
+  assets/CDN calls and no `<script>` tags - fully offline.
+
+Verified: `bats tests/scope_test.sh tests/html_report_test.sh tests/endpoints_test.sh`
+(93/93 passing) and `shellcheck --severity warning` (clean).
 
 ## [1.2.0] - 2026-08-14
 

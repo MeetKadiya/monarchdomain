@@ -3,9 +3,10 @@
 # The following globals are intentionally NOT declared in this file - they
 # are declared and populated by monarchdomain.sh, which is the only script
 # that sources this one: DOMAIN, VERSION, subdomains, FINDINGS, SCAN_HOSTS,
-# SCAN_PORTS, SCAN_TLS, SCAN_HEADERS, SCOPE_ENABLED, SCOPE_FILE,
-# SCOPE_IN_COUNT, SCOPE_OUT_COUNT, SCOPE_BLOCKED_COUNT, SCAN_DURATION_SECONDS,
-# json_escape, write_json_report, write_text_report.
+# SCAN_PORTS, SCAN_TLS, SCAN_HEADERS, SCAN_ENDPOINTS, ENDPOINTS_ENABLED,
+# SCOPE_ENABLED, SCOPE_FILE, SCOPE_IN_COUNT, SCOPE_OUT_COUNT,
+# SCOPE_BLOCKED_COUNT, SCAN_DURATION_SECONDS, json_escape, write_json_report,
+# write_text_report.
 #
 # lib/html_report.sh - MonarchDomain HTML report renderer (Feature 2)
 #
@@ -26,6 +27,7 @@
 #   SCAN_PORTS    : host|port
 #   SCAN_TLS      : host|days_until_expiry|not_after
 #   SCAN_HEADERS  : host|header_name|present|missing
+#   SCAN_ENDPOINTS: url|type|source|status_code   (Feature 3: lib/endpoints.sh)
 #
 # Security: every piece of scan-derived text (domains, hosts, header names,
 # messages, DNS/WHOIS-ish strings, etc.) MUST be passed through html_escape
@@ -297,7 +299,29 @@ function _frag_headers() {
 }
 
 function _frag_endpoints() {
-  printf '<p class="empty-state">MonarchDomain does not currently perform endpoint/path discovery, so no endpoint data is available for this run. This section will populate automatically once an endpoint-discovery source is added to the scanner - no findings are fabricated here.</p>'
+  if [[ "${ENDPOINTS_ENABLED:-0}" -ne 1 ]]; then
+    printf '<p class="empty-state">Endpoint/URL discovery was not enabled for this run (use <code>--endpoints</code> to discover robots.txt, sitemap.xml, HTML links/forms/scripts, JS path references, and common API-doc/well-known paths on live hosts).</p>'
+    return
+  fi
+  if [[ $(_arr_len SCAN_ENDPOINTS) -eq 0 ]]; then
+    printf '<p class="empty-state">Endpoint discovery ran but found no accessible endpoints for this target.</p>'
+    return
+  fi
+  printf '<table class="data-table"><thead><tr><th>URL</th><th>Type</th><th>Source</th><th>Status</th></tr></thead><tbody>'
+  local entry url type source status badge
+  for entry in "${SCAN_ENDPOINTS[@]}"; do
+    IFS='|' read -r url type source status <<< "$entry"
+    if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+      badge="<span class=\"pill pill-good\">$(html_escape "$status")</span>"
+    elif [[ "$status" == "0" ]]; then
+      badge='<span class="pill pill-bad">No response</span>'
+    else
+      badge="<span class=\"pill\">$(html_escape "$status")</span>"
+    fi
+    printf '<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>' \
+      "$(html_escape "$url")" "$(html_escape "$type")" "$(html_escape "$source")" "$badge"
+  done
+  printf '</tbody></table>'
 }
 
 function _frag_findings() {

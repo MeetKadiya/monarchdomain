@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>http://TESTHOST/</loc></url>
+  <url><loc>http://TESTHOST/about</loc></url>
+  <url><loc>http://TESTHOST/api/v1</loc></url>
+  <url><loc>http://OUTOFSCOPEHOST/steal</loc></url>
+</urlset>

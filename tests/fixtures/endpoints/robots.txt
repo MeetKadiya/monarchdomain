@@ -1,0 +1,6 @@
+User-agent: *
+Disallow: /admin/
+Disallow: /private
+Allow: /public/
+Sitemap: http://TESTHOST/sitemap.xml
+Sitemap: http://TESTHOST/sitemap-news.xml
