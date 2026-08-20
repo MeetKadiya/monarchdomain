@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# MonarchDomain v1.1.0 - Subdomain Enumeration & Recon Vulnerability Scanner
+# MonarchDomain - Subdomain Enumeration & Recon Vulnerability Scanner
 # Author: Meet_Kadiya
 # License: MIT
 #
@@ -10,7 +10,29 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-VERSION="1.1.0"
+VERSION="1.3.0"
+
+# ---------------------------------------------------------------------------
+# Resolve the script's real directory (following symlinks, e.g. the one
+# install.sh creates in /usr/local/bin) so bundled library files such as
+# lib/html_report.sh can always be found relative to the actual repo,
+# regardless of how monarchdomain is invoked.
+# ---------------------------------------------------------------------------
+function _resolve_script_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -h "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(_resolve_script_dir)"
+
+# shellcheck disable=SC1091
+[[ -f "$SCRIPT_DIR/lib/html_report.sh" ]] && source "$SCRIPT_DIR/lib/html_report.sh"
+# shellcheck disable=SC1091
+[[ -f "$SCRIPT_DIR/lib/endpoints.sh" ]] && source "$SCRIPT_DIR/lib/endpoints.sh"
 
 trap 'echo -e "\n${YELLOW:-}[!] Interrupted by user. Progress saved - rerun with --resume to continue.${RESET:-}"; exit 130' INT
 
@@ -51,6 +73,19 @@ RESUME=0
 DIFF_MODE=0
 USE_HTTPX=0
 PORTS_SPEC=""
+HTML_REPORT=0
+REPORT_DIR=""
+SCAN_DURATION_SECONDS=0
+
+# Feature 3: HTTP URL & endpoint discovery (lib/endpoints.sh). Disabled by
+# default - it issues additional GET requests against each live host, so
+# it stays opt-in rather than bundled silently into every scan.
+ENDPOINTS_ENABLED=0
+ENDPOINTS_MAX=60
+# shellcheck disable=SC2034  # read by lib/endpoints.sh across the source boundary (see tests/scope_test.sh's SC2034 note)
+ENDPOINTS_TIMEOUT=10
+# shellcheck disable=SC2034  # read by lib/endpoints.sh across the source boundary
+ENDPOINTS_MAX_SITEMAP_DEPTH=2
 
 USER_AGENTS=(
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
@@ -73,6 +108,23 @@ declare -a COMMON_PORTS=("${DEFAULT_PORTS[@]}")
 
 declare -a FINDINGS=()
 declare -a subdomains=()
+
+# Normalized per-host scan data (Feature 2: HTML reporting). Populated by
+# vuln_scan(). Pipe-delimited, same convention as FINDINGS:
+#   SCAN_HOSTS   : host|ip|live(0|1)|technology_or_waf
+#   SCAN_PORTS   : host|port
+#   SCAN_TLS     : host|days_until_expiry|not_after
+#   SCAN_HEADERS : host|header_name|present|missing
+declare -a SCAN_HOSTS=()
+declare -a SCAN_PORTS=()
+declare -a SCAN_TLS=()
+declare -a SCAN_HEADERS=()
+
+# Discovered URLs/endpoints (Feature 3: lib/endpoints.sh), populated by
+# endpoints_discover_host() when --endpoints is given. Pipe-delimited,
+# same convention as the arrays above:
+#   SCAN_ENDPOINTS : url|type|source|status_code
+declare -a SCAN_ENDPOINTS=()
 
 # Scope enforcement state (populated by scope_load)
 SCOPE_ENABLED=0
@@ -157,6 +209,19 @@ Continuity:
 Output:
   -o, --output FILE       Write results to FILE (default: results/<domain>/<timestamp>/)
   -f, --format FORMAT     text | json (default: text)
+      --html-report        Also generate an offline HTML security report (report.html) - a
+                           readable dashboard built from the same scan data as the text/JSON
+                           output. Does not replace or alter either of them.
+      --report-dir DIR     Directory for the HTML report (default: <results_dir>/monarch-report)
+      --endpoints          Discover URLs/endpoints on each live host: robots.txt, sitemap.xml
+                           (incl. sitemap indexes), HTML links/forms/scripts, JS path refs, and
+                           a small fixed list of common API-doc/well-known paths. Safe, GET-only,
+                           non-destructive - never submits forms, authenticates, or brute forces
+                           paths. Every discovered URL is scope-checked before it is requested.
+                           Disabled by default. See "Endpoint Discovery" in README.md.
+      --no-endpoints       Explicitly disable endpoint discovery (useful to override a
+                           .monarchdomainrc default of ENDPOINTS_ENABLED=1).
+      --endpoints-max N    Max endpoint URLs actively requested per host (default: $ENDPOINTS_MAX)
   -L, --log FILE          Append timestamped run log to FILE
   -q, --quiet             Suppress live progress output
 
@@ -175,6 +240,10 @@ Examples:
   $0 -d example.com --ports "80,443,8000-8010" --use-httpx
   $0 -d example.com --resume
   $0 -d example.com --diff
+  $0 -d example.com --html-report
+  $0 -d example.com --html-report --report-dir /tmp/monarch-report
+  $0 -d example.com --endpoints
+  $0 -d example.com --endpoints --endpoints-max 120 --scope program-scope.txt
 
 Config file:
   ~/.monarchdomainrc or ./.monarchdomainrc can predefine any variable above
@@ -210,6 +279,11 @@ function parse_args() {
       --diff) DIFF_MODE=1; shift ;;
       -o|--output) OUTPUT_FILE="$2"; shift 2 ;;
       -f|--format) OUTPUT_FORMAT="$2"; shift 2 ;;
+      --html-report) HTML_REPORT=1; shift ;;
+      --report-dir) REPORT_DIR="$2"; shift 2 ;;
+      --endpoints) ENDPOINTS_ENABLED=1; shift ;;
+      --no-endpoints) ENDPOINTS_ENABLED=0; shift ;;
+      --endpoints-max) ENDPOINTS_MAX="$2"; shift 2 ;;
       -L|--log) LOG_FILE="$2"; shift 2 ;;
       -q|--quiet) QUIET=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -779,17 +853,17 @@ function run_diff() {
 # Findings
 # ---------------------------------------------------------------------------
 function record_finding() {
-  local sev="$1" msg="$2" host="${3:-}"
+  local sev="$1" msg="$2" host="${3:-}" confidence="${4:-Confirmed}"
   local lc="${msg,,}"
   local existing h2 m2
   for existing in "${FINDINGS[@]:-}"; do
     [[ -z "$existing" ]] && continue
-    IFS='|' read -r _ h2 m2 <<< "$existing"
+    IFS='|' read -r _ h2 m2 _ <<< "$existing"
     if [[ "$h2" == "$host" && "${m2,,}" == *"$lc"* ]]; then
       return
     fi
   done
-  FINDINGS+=("$sev|$host|$msg")
+  FINDINGS+=("$sev|$host|$msg|$confidence")
 }
 
 function print_findings() {
@@ -798,14 +872,29 @@ function print_findings() {
     echo -e "${GREEN}No issues flagged by automated checks. Manual review still recommended.${RESET}"
     return
   fi
-  local f sev host msg
+  local f sev host msg confidence
   for f in "${FINDINGS[@]}"; do
-    IFS='|' read -r sev host msg <<< "$f"
+    IFS='|' read -r sev host msg confidence <<< "$f"
     case "$sev" in
       critical) echo -e "${RED}[CRITICAL]${RESET} ($host) $msg" ;;
       major)    echo -e "${YELLOW}[MAJOR]${RESET} ($host) $msg" ;;
       *)        echo -e "${GREEN}[MINOR]${RESET} ($host) $msg" ;;
     esac
+  done
+}
+
+function print_endpoints() {
+  (( ENDPOINTS_ENABLED == 0 )) && return 0
+  echo -e "\n${BOLD}${CYAN}=== Endpoints Discovered ===${RESET}"
+  if (( ${#SCAN_ENDPOINTS[@]} == 0 )); then
+    echo -e "${YELLOW}No endpoints discovered.${RESET}"
+    return
+  fi
+  echo "[ENDPOINTS]"
+  local e url type source status
+  for e in "${SCAN_ENDPOINTS[@]}"; do
+    IFS='|' read -r url type source status <<< "$e"
+    echo "  $url  (${type}, via ${source}, HTTP ${status:-?})"
   done
 }
 
@@ -818,7 +907,10 @@ function detect_waf() {
   echo "$headers" | grep -qi "incap_ses\|incapsula" && sig="Imperva Incapsula"
   echo "$headers" | grep -qi "x-amz-cf-id"         && sig="AWS CloudFront"
   if [[ -n "$sig" ]]; then
-    info "${YELLOW}[i] WAF/CDN detected: $sig (some active checks may be filtered)${RESET}"
+    # Printed to stderr (not via info()) so callers can safely capture this
+    # function's stdout via command substitution (waf=$(detect_waf "$host"))
+    # without the informational line leaking into the captured value.
+    [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}[i] WAF/CDN detected: $sig (some active checks may be filtered)${RESET}" >&2
   fi
   echo "$sig"
 }
@@ -834,35 +926,59 @@ function vuln_scan() {
 
   info "\n${BOLD}${CYAN}[*] Scanning $host${RESET}"
 
-  detect_waf "$host" > /dev/null
+  local ip
+  ip=$(dig +short "$host" 2>/dev/null | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$|^[0-9a-fA-F:]+$' | head -n1)
 
-  local headers
+  local waf
+  waf=$(detect_waf "$host")
+
+  local headers live_scheme="https"
   headers=$(curl -sk -m 10 -I "https://$host" 2>/dev/null || true)
-  [[ -z "$headers" ]] && headers=$(curl -s -m 10 -I "http://$host" 2>/dev/null || true)
+  if [[ -z "$headers" ]]; then
+    headers=$(curl -s -m 10 -I "http://$host" 2>/dev/null || true)
+    live_scheme="http"
+  fi
 
+  local live=0
   if [[ -z "$headers" ]]; then
     info "${YELLOW}[-] No response from $host${RESET}"
-    record_finding minor "Host did not respond to HTTP(S) requests" "$host"
+    record_finding minor "Host did not respond to HTTP(S) requests" "$host" "Confirmed"
   else
+    live=1
     local h sev
     for h in "Content-Security-Policy" "Strict-Transport-Security" "X-Frame-Options" "X-Content-Type-Options" "Referrer-Policy" "Permissions-Policy"; do
       if echo "$headers" | grep -iq "^$h:"; then
         info "${GREEN}[+] $h present${RESET}"
+        SCAN_HEADERS+=("$host|$h|present")
       else
         info "${YELLOW}[-] Missing $h${RESET}"
+        SCAN_HEADERS+=("$host|$h|missing")
         sev="minor"
         [[ "$h" == "Content-Security-Policy" || "$h" == "Strict-Transport-Security" ]] && sev="major"
-        record_finding "$sev" "Missing security header: $h" "$host"
+        record_finding "$sev" "Missing security header: $h" "$host" "Confirmed"
       fi
     done
   fi
+
+  SCAN_HOSTS+=("$host|${ip:-unknown}|$live|${waf:-Unknown}")
 
   info "${BOLD}[*] Port scan (${#COMMON_PORTS[@]} common ports)...${RESET}"
   local p
   for p in "${COMMON_PORTS[@]}"; do
     if check_port_open "$host" "$p"; then
       info "${GREEN}[+] Port $p open${RESET}"
-      [[ "$p" != "80" && "$p" != "443" ]] && record_finding minor "Non-standard port $p open" "$host"
+      SCAN_PORTS+=("$host|$p")
+      if [[ "$p" != "80" && "$p" != "443" ]]; then
+        case "$p" in
+          # Ports commonly associated with database/datastore services - if
+          # reachable from outside, this is a materially more serious
+          # exposure than an arbitrary non-standard port being open.
+          3306|5432|6379|27017|9200)
+            record_finding critical "Sensitive service port $p open (possible database/datastore exposure)" "$host" "Confirmed" ;;
+          *)
+            record_finding minor "Non-standard port $p open" "$host" "Confirmed" ;;
+        esac
+      fi
     fi
     stealth_delay
   done
@@ -876,10 +992,19 @@ function vuln_scan() {
       if [[ -n "$expire_epoch" ]]; then
         days_left=$(( (expire_epoch - $(date +%s)) / 86400 ))
         info "SSL cert expires in $days_left day(s)."
-        (( days_left < 30 )) && record_finding major "SSL certificate expires in $days_left day(s)" "$host"
+        SCAN_TLS+=("$host|$days_left|$not_after")
+        (( days_left < 30 )) && record_finding major "SSL certificate expires in $days_left day(s)" "$host" "Confirmed"
       fi
     else
-      record_finding major "Could not retrieve SSL certificate info" "$host"
+      record_finding major "Could not retrieve SSL certificate info" "$host" "Potential misconfiguration - insufficient evidence"
+    fi
+  fi
+
+  if (( live == 1 && ENDPOINTS_ENABLED == 1 )); then
+    if declare -f endpoints_discover_host > /dev/null 2>&1; then
+      endpoints_discover_host "$host" "$live_scheme"
+    else
+      [[ $QUIET -eq 0 ]] && echo -e "${YELLOW}[!] --endpoints requested but lib/endpoints.sh could not be loaded (expected at $SCRIPT_DIR/lib/endpoints.sh); skipping endpoint discovery for $host.${RESET}" >&2
     fi
   fi
 }
@@ -892,19 +1017,61 @@ function write_json_report() {
     echo "  \"version\": \"$VERSION\","
     echo "  \"domain\": \"$(json_escape "$DOMAIN")\","
     echo "  \"timestamp\": \"$(date -Iseconds)\","
+    echo "  \"duration_seconds\": ${SCAN_DURATION_SECONDS:-0},"
     echo "  \"subdomains\": ["
     local i n=${#subdomains[@]}
     for i in "${!subdomains[@]}"; do
       printf '    "%s"%s\n' "$(json_escape "${subdomains[$i]}")" "$([[ $i -lt $((n-1)) ]] && echo ,)"
     done
     echo "  ],"
+    echo "  \"hosts\": ["
+    n=${#SCAN_HOSTS[@]}
+    local hst ip live tech
+    for i in "${!SCAN_HOSTS[@]}"; do
+      IFS='|' read -r hst ip live tech <<< "${SCAN_HOSTS[$i]}"
+      printf '    {"host": "%s", "ip": "%s", "live": %s, "technology": "%s"}%s\n' \
+        "$(json_escape "$hst")" "$(json_escape "$ip")" \
+        "$([[ "$live" == "1" ]] && echo true || echo false)" \
+        "$(json_escape "$tech")" "$([[ $i -lt $((n-1)) ]] && echo ,)"
+    done
+    echo "  ],"
+    echo "  \"open_ports\": ["
+    n=${#SCAN_PORTS[@]}
+    local pport
+    for i in "${!SCAN_PORTS[@]}"; do
+      IFS='|' read -r hst pport <<< "${SCAN_PORTS[$i]}"
+      printf '    {"host": "%s", "port": %s}%s\n' \
+        "$(json_escape "$hst")" "$pport" "$([[ $i -lt $((n-1)) ]] && echo ,)"
+    done
+    echo "  ],"
+    echo "  \"tls\": ["
+    n=${#SCAN_TLS[@]}
+    local days notafter
+    for i in "${!SCAN_TLS[@]}"; do
+      IFS='|' read -r hst days notafter <<< "${SCAN_TLS[$i]}"
+      printf '    {"host": "%s", "days_until_expiry": %s, "not_after": "%s"}%s\n' \
+        "$(json_escape "$hst")" "$days" "$(json_escape "$notafter")" "$([[ $i -lt $((n-1)) ]] && echo ,)"
+    done
+    echo "  ],"
     echo "  \"findings\": ["
     n=${#FINDINGS[@]}
-    local sev host msg
+    local sev host msg confidence
     for i in "${!FINDINGS[@]}"; do
-      IFS='|' read -r sev host msg <<< "${FINDINGS[$i]}"
-      printf '    {"severity": "%s", "host": "%s", "message": "%s"}%s\n' \
-        "$(json_escape "$sev")" "$(json_escape "$host")" "$(json_escape "$msg")" "$([[ $i -lt $((n-1)) ]] && echo ,)"
+      IFS='|' read -r sev host msg confidence <<< "${FINDINGS[$i]}"
+      printf '    {"severity": "%s", "host": "%s", "message": "%s", "confidence": "%s"}%s\n' \
+        "$(json_escape "$sev")" "$(json_escape "$host")" "$(json_escape "$msg")" \
+        "$(json_escape "${confidence:-Confirmed}")" "$([[ $i -lt $((n-1)) ]] && echo ,)"
+    done
+    echo "  ],"
+    echo "  \"endpoints_enabled\": $([[ $ENDPOINTS_ENABLED -eq 1 ]] && echo true || echo false),"
+    echo "  \"endpoints\": ["
+    n=${#SCAN_ENDPOINTS[@]}
+    local eurl etype esource estatus
+    for i in "${!SCAN_ENDPOINTS[@]}"; do
+      IFS='|' read -r eurl etype esource estatus <<< "${SCAN_ENDPOINTS[$i]}"
+      printf '    {"url": "%s", "type": "%s", "source": "%s", "status_code": %s}%s\n' \
+        "$(json_escape "$eurl")" "$(json_escape "$etype")" "$(json_escape "$esource")" \
+        "${estatus:-0}" "$([[ $i -lt $((n-1)) ]] && echo ,)"
     done
     echo "  ],"
     echo "  \"scope\": {"
@@ -918,7 +1085,55 @@ function write_json_report() {
   } > "$out"
 }
 
+# ---------------------------------------------------------------------------
+# write_text_report OUT_PATH
+# Extracted from main() so both the normal text-format run and
+# build_html_report() (lib/html_report.sh) can produce the identical text
+# report without duplicating this formatting logic.
+# ---------------------------------------------------------------------------
+function write_text_report() {
+  local out="$1"
+  {
+    echo "MonarchDomain v$VERSION scan report - $(date)"
+    echo "Target: $DOMAIN"
+    echo
+    echo "Subdomains (${#subdomains[@]}):"
+    printf '  %s\n' "${subdomains[@]}"
+    echo
+    echo "Findings:"
+    local f sev host msg confidence
+    for f in "${FINDINGS[@]}"; do
+      IFS='|' read -r sev host msg confidence <<< "$f"
+      printf '  [%s] (%s) %s\n' "$sev" "$host" "$msg"
+    done
+    echo
+    echo "Endpoints (${#SCAN_ENDPOINTS[@]}):"
+    if [[ $ENDPOINTS_ENABLED -eq 1 ]]; then
+      local e eurl etype esource estatus
+      for e in ${SCAN_ENDPOINTS[@]+"${SCAN_ENDPOINTS[@]}"}; do
+        IFS='|' read -r eurl etype esource estatus <<< "$e"
+        printf '  [%s] %s (via %s, HTTP %s)\n' "$etype" "$eurl" "$esource" "${estatus:-?}"
+      done
+    else
+      echo "  Endpoint discovery not enabled (use --endpoints)."
+    fi
+    echo
+    echo "Scope:"
+    if [[ $SCOPE_ENABLED -eq 1 ]]; then
+      echo "  Enabled: yes ($SCOPE_FILE)"
+      echo "  In scope: $SCOPE_IN_COUNT"
+      echo "  Out of scope: $SCOPE_OUT_COUNT"
+      echo "  Blocked operations: $SCOPE_BLOCKED_COUNT"
+    else
+      echo "  Enabled: no"
+    fi
+  } > "$out"
+}
+
 function main() {
+  local scan_start_epoch
+  scan_start_epoch=$(date +%s)
+
   if [[ $# -eq 0 ]]; then usage; exit 1; fi
   parse_args "$@"
   check_dependencies
@@ -929,6 +1144,10 @@ function main() {
   fi
   if [[ ! "$THREADS" =~ ^[0-9]+$ || "$THREADS" -lt 1 ]]; then
     echo -e "${RED}[Error]${RESET} --threads must be a positive integer."
+    exit 1
+  fi
+  if [[ ! "$ENDPOINTS_MAX" =~ ^[0-9]+$ || "$ENDPOINTS_MAX" -lt 1 ]]; then
+    echo -e "${RED}[Error]${RESET} --endpoints-max must be a positive integer."
     exit 1
   fi
   if [[ $STRICT_SCOPE -eq 1 && -z "$SCOPE_FILE" ]]; then
@@ -1059,35 +1278,26 @@ function main() {
   done
 
   print_findings
+  print_endpoints
   print_scope_summary
+
+  SCAN_DURATION_SECONDS=$(( $(date +%s) - scan_start_epoch ))
 
   if [[ "$OUTPUT_FORMAT" == "json" ]]; then
     write_json_report "${OUTPUT_FILE:-$results_dir/report.json}"
   else
-    {
-      echo "MonarchDomain v$VERSION scan report - $(date)"
-      echo "Target: $DOMAIN"
-      echo
-      echo "Subdomains (${#subdomains[@]}):"
-      printf '  %s\n' "${subdomains[@]}"
-      echo
-      echo "Findings:"
-      local f sev host msg
-      for f in "${FINDINGS[@]}"; do
-        IFS='|' read -r sev host msg <<< "$f"
-        printf '  [%s] (%s) %s\n' "$sev" "$host" "$msg"
-      done
-      echo
-      echo "Scope:"
-      if [[ $SCOPE_ENABLED -eq 1 ]]; then
-        echo "  Enabled: yes ($SCOPE_FILE)"
-        echo "  In scope: $SCOPE_IN_COUNT"
-        echo "  Out of scope: $SCOPE_OUT_COUNT"
-        echo "  Blocked operations: $SCOPE_BLOCKED_COUNT"
-      else
-        echo "  Enabled: no"
-      fi
-    } > "${OUTPUT_FILE:-$results_dir/report.txt}"
+    write_text_report "${OUTPUT_FILE:-$results_dir/report.txt}"
+  fi
+
+  if [[ $HTML_REPORT -eq 1 ]]; then
+    if declare -f build_html_report > /dev/null 2>&1; then
+      local html_dir="${REPORT_DIR:-$results_dir/monarch-report}"
+      build_html_report "$html_dir"
+      info "${CYAN}[*] HTML report: $html_dir/report.html${RESET}"
+      log_line INFO "HTML report written to $html_dir/report.html"
+    else
+      echo -e "${YELLOW}[!] --html-report requested but lib/html_report.sh could not be loaded (expected at $SCRIPT_DIR/lib/html_report.sh); skipping HTML report.${RESET}" >&2
+    fi
   fi
 
   log_line INFO "Run finished."
